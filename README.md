@@ -10,7 +10,8 @@ The system significantly outperforms the required threshold and the popularity b
 
 ## 🌟 Key Features
 * **Hard Equipment Filter:** Ensures recommended recipes only require tools the user already owns (e.g., V60, Chemex, Aeropress).
-* **Hybrid Logic:** * **Warm Start:** Uses a **LightGBM** ranking model for users with interaction history.
+* **Hybrid Logic:** 
+    * **Warm Start:** Uses a **LightGBM** ranking model for users with interaction history.
     * **Cold Start:** Implements **Content-Based Filtering** (Euclidean distance on flavor profiles) for new users.
 * **Flavor Profile Matching:** Calculates "taste deltas" between user preferences and recipe attributes (bitterness, acidity, body, sweetness).
 * **Full-Stack Implementation:** Includes a FastAPI backend and a Streamlit frontend.
