@@ -1,0 +1,19 @@
+# Data Processing & Mathematics
+pandas
+numpy
+
+# Machine Learning & Serialization
+lightgbm
+scikit-learn
+joblib
+
+# Backend API
+fastapi
+uvicorn
+
+# Frontend & UI
+streamlit
+requests
+
+# Notebook Support (Optional but recommended)
+ipykernel
