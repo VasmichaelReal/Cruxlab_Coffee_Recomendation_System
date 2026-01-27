@@ -1,30 +1,49 @@
 import streamlit as st
 import requests
 
-st.set_page_config(page_title="Coffee AI Coach", page_icon="☕")
+BASE_URL = "http://127.0.0.1:8000"
 
-st.title("☕ Coffee AI Recommender")
-st.write("Enter your User ID to get personalized recipes based on your taste and equipment.")
+st.set_page_config(page_title="Coffee AI Coach", page_icon="☕", layout="wide")
+st.title("☕ Coffee AI Coach")
 
-user_id = st.text_input("User ID", placeholder="e.g., user_123")
+# 1. Fetching user list
+try:
+    users_res = requests.get(f"{BASE_URL}/users").json()
+    user_options = {
+        (f"{u['user_id']} (❄️ Cold)" if u['is_cold'] else u['user_id']): u['user_id'] 
+        for u in users_res['users']
+    }
+    
+    selected_label = st.sidebar.selectbox("Select User:", options=list(user_options.keys()))
+    uid = user_options[selected_label]
+    
+    # User Profile Card in Sidebar
+    st.sidebar.markdown("---")
+    st.sidebar.header("📋 Profile Info")
+    profile = requests.get(f"{BASE_URL}/user/{uid}").json()
+    st.sidebar.info(f"**Equipment:** {', '.join(profile['owned_equipment'])}")
+    
+    for taste, val in profile['preferences'].items():
+        if taste != 'strength':
+            st.sidebar.text(f"{taste.capitalize()}: {val}")
+            st.sidebar.progress(float(val))
 
-if st.button("Get My Coffee Recipes"):
-    if user_id:
-        with st.spinner('Thinking about the perfect brew...'):
-            try:
-                # Звертаємося до нашого бекенду
-                response = requests.get(f"http://localhost:8000/recommend/{user_id}")
-                if response.status_code == 200:
-                    data = response.json()
-                    st.success(f"Top {len(data['recommendations'])} recommendations for you:")
-                    
-                    for rec in data['recommendations']:
-                        with st.expander(f"🌟 {rec['name']} (Score: {rec['score']})"):
-                            st.write(f"**Recipe ID:** {rec['recipe_id']}")
-                            st.write(f"**Required Equipment:** {', '.join(rec['equipment'])}")
-                else:
-                    st.error("User not found or API error.")
-            except Exception as e:
-                st.error(f"Connection failed: {e}")
+except Exception as e:
+    st.error(f"Backend Connection Error: {e}")
+    st.stop()
+
+# 2. Main Recommendations logic
+if st.button("🚀 Get Recommendations"):
+    res = requests.get(f"{BASE_URL}/recommend/{uid}")
+    if res.status_code == 200:
+        data = res.json()
+        st.subheader(f"Top Recipes for you")
+        
+        for rec in data['recommendations']:
+            with st.expander(f"✨ {rec['name']} (Score: {rec['score']})"):
+                st.info(f"💡 **Why?** {rec['details']['justification']}")
+                st.write(f"**Equipment needed:** {', '.join(rec['details']['equipment'])}")
+                st.write("**Flavor Profile:**")
+                st.json(rec['details']['flavor'])
     else:
-        st.warning("Please enter a User ID.")
+        st.error("Failed to fetch recommendations.")
