@@ -2,8 +2,8 @@ import streamlit as st
 import api_client as api
 import ui_components as ui
 
-st.set_page_config(page_title="Coffee AI Coach", page_icon="☕", layout="wide")
-st.title("☕ Coffee AI Coach")
+st.set_page_config(page_title="Coffee recomendation system", page_icon="☕", layout="wide")
+st.title("Coffee recomendation system")
 
 # 1. User Selection
 users = api.fetch_users()

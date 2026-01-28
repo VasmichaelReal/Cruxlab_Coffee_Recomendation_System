@@ -1,8 +1,8 @@
 def format_user_profile(user_row):
-    """Parses raw user data into a structured profile response."""
+    """Formats the user profile with native types. Strength is normalized (0-1)."""
     return {
-        "user_id": user_row['user_id'],
-        "owned_equipment": list(user_row['owned_equipment']),
+        "user_id": str(user_row['user_id']),
+        "owned_equipment": [str(e) for e in user_row['owned_equipment']],
         "preferences": {
             "bitterness": float(user_row['taste_pref_bitterness']),
             "sweetness": float(user_row['taste_pref_sweetness']),
@@ -12,25 +12,8 @@ def format_user_profile(user_row):
         }
     }
 
-def format_recommendation(recipe_row, score, is_cold):
-    """Formats a single recipe recommendation with justification."""
-    justification = (
-        "Matches your profile through flavor similarity (Cold Start)." if is_cold 
-        else "Selected based on your positive brewing history (ML Ranking)."
-    )
-    return {
-        "recipe_id": str(recipe_row['recipe_id']),
-        "name": str(recipe_row['name']),
-        "score": round(float(score), 4),
-        "details": {
-            "justification": justification, 
-            "equipment": list(recipe_row['required_equipment']),
-            "flavor": {
-                "bitterness": float(recipe_row['taste_bitterness']),
-                "sweetness": float(recipe_row['taste_sweetness']),
-                "acidity": float(recipe_row['taste_acidity']),
-                "body": float(recipe_row['taste_body']),
-                "strength": float(recipe_row['strength_norm'])
-            }
-        }
-    }
+def process_ml_results(ml_recs: list, is_cold: bool):
+    """Wraps ML results with cold-start flag."""
+    for rec in ml_recs:
+        rec['is_cold_start'] = bool(is_cold)
+    return ml_recs
