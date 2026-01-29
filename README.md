@@ -75,7 +75,7 @@ To solve the "Training-Serving Skew," we implemented **Explicit Feature Construc
 
 ### 1. Clone the repository
 ```bash
-git clone [https://github.com/VasmichaelReal/Cruxlab_Coffee_Recomendation_System.git](https://github.com/VasmichaelReal/Cruxlab_Coffee_Recomendation_System.git)
+git clone https://github.com/VasmichaelReal/Cruxlab_Coffee_Recomendation_System.git
 cd Cruxlab_Coffee_Recomendation_System
 ```
 ### 2. Setup environment
