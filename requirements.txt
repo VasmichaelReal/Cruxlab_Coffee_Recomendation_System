@@ -1,11 +1,13 @@
 # Data Processing & Mathematics
 pandas
 numpy
+matplotlib
 
-# Machine Learning & Serialization
+# Machine Learning & Optimization
 lightgbm
 scikit-learn
 joblib
+optuna
 
 # Backend API
 fastapi
@@ -15,5 +17,5 @@ uvicorn
 streamlit
 requests
 
-# Notebook Support (Optional but recommended)
+# Notebook Support
 ipykernel

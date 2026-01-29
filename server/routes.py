@@ -36,7 +36,7 @@ async def get_user(user_id: str):
 async def get_rec(user_id: str, n: int = 5, strategy: str = "hybrid_ml"):
     """
     Core recommendation endpoint.
-    Retrieves actual ratings from the validation set (state.val).
+    Uses the optimized ML model (or fallback strategies) to predict preferences.
     """
     if user_id not in state.users['user_id'].values:
         raise HTTPException(status_code=404, detail="Unknown User")
@@ -45,19 +45,18 @@ async def get_rec(user_id: str, n: int = 5, strategy: str = "hybrid_ml"):
         # Check if user has no interaction history
         is_cold = state.train[state.train['user_id'] == user_id].empty
         
-        # Call recommender passing the validation set for actual rating lookup
+        # Call recommender WITHOUT state.val
+        # The new recommender function signature is: recommend(user_id, users, recipes, train, n, strategy)
         ml_results = recommend(
             user_id, 
             state.users, 
             state.recipes, 
             state.train, 
-            state.val, 
             n=n, 
             strategy=strategy
         )
         
         # Defensive fix: Filter out any items where the score is NaN to prevent JSON crash
-        # This occurs if a rating is missing in the source CSV/dataframe
         valid_results = [
             res for res in ml_results 
             if not (isinstance(res.get('score'), float) and math.isnan(res.get('score')))

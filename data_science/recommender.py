@@ -1,145 +1,238 @@
-import os
-import numpy as np
 import pandas as pd
+import numpy as np
+import joblib
+import os
 from datetime import datetime
-from typing import List, Tuple, Optional, Dict, Any
-from sklearn.metrics.pairwise import cosine_similarity
+from typing import List, Dict, Any
 
-# Absolute path for data access
+# --- 1. CONFIGURATION & LOADING ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_PATH = os.path.join(BASE_DIR, 'models', 'coffee_model_optimized.pkl')
 
-# --- HELPER FUNCTIONS ---
+model = None
+try:
+    if os.path.exists(MODEL_PATH):
+        model = joblib.load(MODEL_PATH)
+        print(f"✅ ML Model loaded: {MODEL_PATH}")
+    else:
+        print(f"⚠️ ML Model not found at {MODEL_PATH}")
+except Exception as e:
+    print(f"❌ Error loading model: {e}")
 
-def filter_by_equipment(user_owned_equipment: list, recipes_df: pd.DataFrame) -> pd.DataFrame:
-    """Filters recipes based on the equipment owned by the user."""
-    user_set = set(user_owned_equipment)
-    mask = recipes_df['required_equipment'].apply(lambda req: set(req).issubset(user_set))
+# --- 2. HELPER FUNCTIONS ---
+
+def filter_by_equipment(user_owned_equipment, recipes_df):
+    """Filters recipes based on user equipment."""
+    if isinstance(user_owned_equipment, str):
+        import ast
+        try:
+            user_set = set(ast.literal_eval(user_owned_equipment))
+        except:
+            user_set = {user_owned_equipment}
+    else:
+        user_set = set(user_owned_equipment)
+        
+    eq_col = 'equipment' if 'equipment' in recipes_df.columns else 'required_equipment'
+    if eq_col not in recipes_df.columns:
+        return recipes_df.copy()
+
+    def check(req):
+        if not req: return True
+        if isinstance(req, (list, tuple, set, np.ndarray)):
+            return set(req).issubset(user_set)
+        return req in user_set
+
+    mask = recipes_df[eq_col].apply(check)
     return recipes_df[mask].copy()
 
-def get_time_context(hour: Optional[int] = None) -> str:
-    """Determines the time-of-day category: morning, afternoon, or evening."""
-    if hour is None:
-        hour = datetime.now().hour
-    if 6 <= hour < 12: return "morning"
-    elif 12 <= hour < 18: return "afternoon"
-    else: return "evening"
+def prepare_features_for_ml(user_row, candidates_df):
+    """
+    Constructs features EXACTLY as the optimized LightGBM expects them.
+    """
+    df = candidates_df.copy()
+    u = user_row.to_dict()
+    
+    # 1. User Preferences Mapping
+    def get_pref(key_base):
+        for k in [f'taste_pref_{key_base}', f'pref_{key_base}', f'preferred_{key_base}']:
+            if k in u and pd.notnull(u[k]): return float(u[k])
+        return 0.5
 
-def calculate_interaction_weight(row: pd.Series, current_hour: int, lambda_val: float = 0.005, floor: float = 0.1) -> float:
-    """Calculates weight using exponential time decay and context."""
-    days_diff = (datetime.now() - pd.to_datetime(row['timestamp'])).days
-    w_recency = max(np.exp(-lambda_val * days_diff), floor)
-    current_slot = get_time_context(current_hour)
-    historical_slot = get_time_context(pd.to_datetime(row['timestamp']).hour)
-    w_context = 1.5 if current_slot == historical_slot else 1.0
-    return float(w_recency * w_context)
+    df['taste_pref_bitterness'] = get_pref('bitterness')
+    df['taste_pref_sweetness'] = get_pref('sweetness')
+    df['taste_pref_acidity'] = get_pref('acidity')
+    df['taste_pref_body'] = get_pref('body')
+    df['pref_strength_norm'] = get_pref('strength')
 
-def get_weighted_user_profile(user_id: str, train_df: pd.DataFrame, recipes_df: pd.DataFrame, lambda_val: float = 0.005) -> Optional[dict]:
-    """Constructs a dynamic user taste profile based on weighted interaction history."""
-    history = train_df[train_df['user_id'] == user_id].merge(recipes_df, on='recipe_id')
-    if history.empty: return None
-
-    curr_hour = datetime.now().hour
-    history['final_weight'] = history.apply(
-        lambda row: calculate_interaction_weight(row, curr_hour, lambda_val=lambda_val), axis=1
-    )
-
-    tastes = ['taste_bitterness', 'taste_sweetness', 'taste_acidity', 'taste_body', 'strength_norm']
-    dynamic_profile = {}
-    total_w = history['final_weight'].sum()
+    # 2. Recipe Tastes
+    tastes = ['bitterness', 'sweetness', 'acidity', 'body']
     for t in tastes:
-        dynamic_profile[t] = float((history[t] * history['final_weight']).sum() / total_w)
-    return dynamic_profile
+        if f'taste_{t}' not in df.columns and t in df.columns:
+            df[f'taste_{t}'] = df[t]
+
+    # 3. Strength Normalization
+    if 'strength_norm' not in df.columns:
+        df['strength_norm'] = df['strength'] / 10.0 if 'strength' in df.columns else 0.5
+
+    # 4. Deltas
+    for t in tastes:
+        df[f'delta_{t}'] = abs(df[f'taste_{t}'] - df[f'taste_pref_{t}'])
+    
+    df['strength_match'] = (abs(df['strength_norm'] - df['pref_strength_norm']) < 0.2).astype(int)
+
+    features = [
+        'taste_bitterness', 'taste_sweetness', 'taste_acidity', 'taste_body', 'strength_norm',
+        'taste_pref_bitterness', 'taste_pref_sweetness', 'taste_pref_acidity', 'taste_pref_body', 
+        'pref_strength_norm', 'delta_bitterness', 'delta_sweetness', 'delta_acidity', 'delta_body', 'strength_match'
+    ]
+    
+    for f in features:
+        if f not in df.columns: df[f] = 0.0
+        
+    return df[features]
 
 def generate_recommendation_details(user_info: pd.Series, recipe: pd.Series) -> Dict[str, Any]:
-    """Generates justification and flavor profile. Strength remains numerical."""
+    """Generates justification text and flavor profile for the UI."""
     tastes = ['bitterness', 'sweetness', 'acidity', 'body']
-    deltas = {t: abs(float(recipe[f'taste_{t}']) - float(user_info[f'taste_pref_{t}'])) for t in tastes}
     
-    # Justification logic based on Feature Importance Gain
-    if deltas['body'] < 0.2:
-        justification = "Matches your preference for a specific mouthfeel and body."
-    elif deltas['sweetness'] < 0.2:
-        justification = "Excellent match for your preferred sweetness level."
+    # Safe getters
+    def get_u_pref(t):
+        return float(user_info.get(f'taste_pref_{t}', user_info.get(f'pref_{t}', 0.5)))
+    
+    def get_r_val(t):
+        return float(recipe.get(f'taste_{t}', recipe.get(t, 0.5)))
+
+    deltas = {t: abs(get_r_val(t) - get_u_pref(t)) for t in tastes}
+    
+    # Justification logic
+    if deltas['body'] < 0.15:
+        justification = "Matches your preference for body and texture."
+    elif deltas['sweetness'] < 0.15:
+        justification = "Excellent match for your sweetness level."
+    elif deltas['acidity'] < 0.15:
+        justification = "Aligns well with your acidity preference."
     else:
         best_match = min(deltas, key=deltas.get)
-        justification = f"Aligned with your taste history, specifically in {best_match}."
+        justification = f"Selected based on your taste profile ({best_match})."
 
     return {
         "justification": justification,
         "flavor": {
-            "bitterness": float(recipe['taste_bitterness']),
-            "sweetness": float(recipe['taste_sweetness']),
-            "acidity": float(recipe['taste_acidity']),
-            "body": float(recipe['taste_body']),
-            "strength": int(float(recipe['strength'])) # ПОВЕРНУТО ЧИСЛО (1-5)
+            "bitterness": get_r_val('bitterness'),
+            "sweetness": get_r_val('sweetness'),
+            "acidity": get_r_val('acidity'),
+            "body": get_r_val('body'),
+            "strength": float(recipe.get('strength', 5))
         },
-        "equipment": [str(e) for e in recipe['required_equipment']]
+        "equipment": recipe.get('equipment', [])
     }
 
-# --- STRATEGY FUNCTIONS ---
+# --- 3. STRATEGIES ---
 
-def recommend_popular(user_id: str, users_df: pd.DataFrame, recipes_df: pd.DataFrame, train_df: pd.DataFrame, n: int = 5) -> List[Tuple[str, float]]:
-    user_info = users_df[users_df['user_id'] == user_id].iloc[0]
-    available = filter_by_equipment(user_info['owned_equipment'], recipes_df)
-    temp_train = train_df.copy()
-    temp_train['timestamp'] = pd.to_datetime(temp_train['timestamp'])
-    days_diff = (datetime.now() - temp_train['timestamp']).dt.days
-    temp_train['w'] = np.maximum(np.exp(-0.005 * days_diff), 0.1)
-    pop = temp_train.groupby('recipe_id')['w'].sum().reset_index().rename(columns={'w': 'score'})
-    res = available.merge(pop, on='recipe_id', how='left').fillna(0)
-    res = res.sort_values('score', ascending=False).head(n)
-    max_val = float(pop['score'].max()) if not pop.empty else 1.0
-    return list(zip(res['recipe_id'].astype(str), res['score'].astype(float) / max_val))
+def recommend_ml(user_id, users, recipes, train, n=5):
+    if model is None:
+        return recommend_content(user_id, users, recipes, train, n)
 
-def recommend_content(user_id: str, users_df: pd.DataFrame, recipes_df: pd.DataFrame, n: int = 5) -> List[Tuple[str, float]]:
-    user_info = users_df[users_df['user_id'] == user_id].iloc[0]
-    available = filter_by_equipment(user_info['owned_equipment'], recipes_df)
-    taste_features = ['bitterness', 'sweetness', 'acidity', 'body']
-    diffs = [(available[f'taste_{t}'] - user_info[f'taste_pref_{t}'])**2 for t in taste_features]
-    available['score'] = 1 / (1 + np.sqrt(sum(diffs)))
-    res = available.sort_values('score', ascending=False).head(n)
-    return list(zip(res['recipe_id'].astype(str), res['score'].astype(float)))
+    user_info = users[users['user_id'] == user_id].iloc[0]
+    available = filter_by_equipment(user_info['owned_equipment'], recipes)
+    
+    if available.empty: return []
 
-# --- MAIN DISPATCHER ---
-
-def recommend(
-    user_id: str, 
-    users_df: pd.DataFrame, 
-    recipes_df: pd.DataFrame, 
-    train_df: pd.DataFrame, 
-    val_df: pd.DataFrame, 
-    n: int = 5, 
-    strategy: str = "hybrid_ml"
-) -> List[Dict[str, Any]]:
-    """Dispatcher. Pulls ACTUAL ratings from validation set."""
-    u_info = users_df[users_df['user_id'] == user_id].iloc[0]
-    raw_results = []
-
-    if strategy == "hybrid_ml":
-        v_df = val_df.copy()
-        v_df['user_id'] = v_df['user_id'].astype(str)
-        v_df['recipe_id'] = v_df['recipe_id'].astype(str)
-        r_df = recipes_df.copy()
-        r_df['recipe_id'] = r_df['recipe_id'].astype(str)
-
-        user_val = v_df[v_df['user_id'] == str(user_id)].dropna(subset=['rating']).copy()
+    try:
+        X_pred = prepare_features_for_ml(user_info, available)
+        probs = model.predict_proba(X_pred)[:, 1]
         
-        if not user_val.empty:
-            user_val['score'] = user_val['rating'].astype(float) / 5.0
-            res = user_val.merge(r_df, on='recipe_id').sort_values('score', ascending=False).head(n)
-            raw_results = list(zip(res['recipe_id'], res['score']))
+        available = available.copy()
+        available['score'] = probs
+        # Return ID and Score for enrichment
+        return available.sort_values('score', ascending=False).head(n)[['recipe_id', 'score']].to_dict('records')
+    except Exception as e:
+        print(f"ML Error: {e}")
+        return recommend_content(user_id, users, recipes, train, n)
 
-    if not raw_results:
-        raw_results = recommend_content(user_id, users_df, recipes_df, n)
+def recommend_popular(user_id, users, recipes, train, n=5, precalculated_pop=None):
+    user_info = users[users['user_id'] == user_id].iloc[0]
+    available = filter_by_equipment(user_info['owned_equipment'], recipes)
+    
+    if available.empty: return []
 
-    final_output = []
-    for rid, score in raw_results:
-        safe_score = float(score) if not np.isnan(score) else 0.0
-        recipe_row = recipes_df[recipes_df['recipe_id'].astype(str) == str(rid)].iloc[0]
-        final_output.append({
-            "recipe_id": str(rid),
-            "name": str(recipe_row['name']),
-            "score": round(safe_score, 2),
-            "details": generate_recommendation_details(u_info, recipe_row)
-        })
-    return final_output
+    if precalculated_pop is not None:
+        res = available.merge(precalculated_pop, on='recipe_id', how='left').fillna(0)
+    else:
+        temp_train = train.copy()
+        temp_train['timestamp'] = pd.to_datetime(temp_train['timestamp'])
+        days_diff = (datetime.now() - temp_train['timestamp']).dt.days
+        temp_train['w'] = np.maximum(np.exp(-0.005 * days_diff), 0.1)
+        pop = temp_train.groupby('recipe_id')['w'].sum().reset_index().rename(columns={'w': 'score'})
+        res = available.merge(pop, on='recipe_id', how='left').fillna(0)
+    
+    return res.sort_values('score', ascending=False).head(n)[['recipe_id', 'score']].to_dict('records')
+
+def recommend_content(user_id, users, recipes, train, n=5, weights=None):
+    user_info = users[users['user_id'] == user_id].iloc[0]
+    available = filter_by_equipment(user_info['owned_equipment'], recipes)
+    
+    if available.empty: return []
+
+    # Use ML features for robust calculation
+    feat = prepare_features_for_ml(user_info, available)
+    
+    if weights is None:
+        weights = {'delta_bitterness': 1.0, 'delta_sweetness': 1.0, 'delta_acidity': 1.0, 'delta_body': 1.0}
+
+    dist = 0
+    for col, w in weights.items():
+        if col in feat.columns:
+            dist += w * (feat[col] ** 2)
+            
+    available = available.copy()
+    available['score'] = 1 / (1 + np.sqrt(dist))
+    
+    return available.sort_values('score', ascending=False).head(n)[['recipe_id', 'score']].to_dict('records')
+
+# --- 4. MAIN DISPATCHER (ENRICHMENT LAYER) ---
+
+def recommend(user_id, users, recipes, train, n=5, strategy='hybrid_ml'):
+    """
+    Returns full recommendation objects (Name, Score, Details) for the Frontend.
+    """
+    try:
+        # 1. Get Raw Recommendations (ID + Score)
+        raw_recs = []
+        if strategy == 'hybrid_ml':
+            raw_recs = recommend_ml(user_id, users, recipes, train, n)
+        elif strategy == 'popularity':
+            raw_recs = recommend_popular(user_id, users, recipes, train, n)
+        elif strategy == 'weighted_content':
+            w = {'delta_bitterness': 1.2, 'delta_sweetness': 1.5, 'delta_acidity': 1.0, 'delta_body': 0.8}
+            raw_recs = recommend_content(user_id, users, recipes, train, n, weights=w)
+        else:
+            raw_recs = recommend_content(user_id, users, recipes, train, n)
+
+        # 2. Enrich with Name, Details, Justification
+        final_output = []
+        user_info = users[users['user_id'] == user_id].iloc[0]
+
+        for item in raw_recs:
+            rid = item['recipe_id']
+            score = item.get('score', 0.0)
+            
+            # Find recipe row
+            recipe_row = recipes[recipes['recipe_id'] == rid]
+            if recipe_row.empty: continue
+            recipe_row = recipe_row.iloc[0]
+            
+            # Build full object for frontend
+            rec_obj = {
+                "recipe_id": str(rid),
+                "name": str(recipe_row.get('name', 'Unknown Coffee')),
+                "score": round(float(score), 2),
+                "details": generate_recommendation_details(user_info, recipe_row)
+            }
+            final_output.append(rec_obj)
+            
+        return final_output
+
+    except Exception as e:
+        print(f"Global Rec Error: {e}")
+        return []

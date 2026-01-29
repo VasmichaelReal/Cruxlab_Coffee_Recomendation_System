@@ -2,9 +2,10 @@
 
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/downloads/release/python-3120/)
 [![LightGBM](https://img.shields.io/badge/ML-LightGBM-orange.svg)](https://lightgbm.readthedocs.io/)
+[![FastAPI](https://img.shields.io/badge/Backend-FastAPI-green.svg)](https://fastapi.tiangolo.com/)
+[![Streamlit](https://img.shields.io/badge/Frontend-Streamlit-red.svg)](https://streamlit.io/)
 
-A high-performance, multi-strategy recommendation engine designed to provide personalized coffee recipe suggestions. This system evolved from static Euclidean distance baselines to a **State-of-the-Art (SOTA) Hybrid LightGBM** model, incorporating temporal decay and dynamic user taste profiles.
-
+A high-performance, multi-strategy recommendation engine designed to provide personalized coffee recipe suggestions. This system evolved from static Euclidean distance baselines to a **State-of-the-Art (SOTA) Hybrid LightGBM Classifier**, incorporating explicit feature engineering and dynamic user taste profiles.
 ---
 
 ## Repository Structure
@@ -27,34 +28,38 @@ The project is organized into modular components to ensure scalability and maint
 
 ## Benchmarking Results
 
-The models were evaluated using **Mean NDCG@5** (Normalized Discounted Cumulative Gain) to measure ranking quality across a warm-start validation set. This metric ensures that the most relevant recipes for each user appear at the top of the recommendation list.
+The models were evaluated using **Mean NDCG@5** (Normalized Discounted Cumulative Gain) on a held-out validation set. This metric ensures that the most relevant recipes appear at the top of the list.
 
 | Strategy | NDCG@5 | Category |
 | :--- | :--- | :--- |
-| **Hybrid LightGBM (SOTA)** | **0.4768** | Personalized (Dynamic/ML) |
-| **Time-Aware Popularity** | 0.4530 | Global Baseline (Time-Aware) |
-| **Weighted Content (Research)**| 0.4287 | Personalized (Dynamic/ML) |
+| **Hybrid LightGBM (SOTA)** | **0.4906** | Personalized (Dynamic/ML) |
+| **Time-Aware Popularity** | 0.4542 | Global Baseline (Time-Aware) |
+| **Weighted Content**| 0.3879 | Feature-Based Filtering |
 | **Pure Content (Euclidean)** | 0.3879 | Static Baseline |
-| **User-User Hybrid (Cosine)** | 0.3449 | Collaborative Filtering |
+| **User-User Hybrid** | 0.3873 | Collaborative Filtering |
 
 ### Key Observations:
-* **Hybrid Advantage**: The LightGBM model outperforms all baselines by identifying non-linear patterns between user preferences and taste attributes.
-* **Temporal Logic**: The Time-Aware Popularity baseline shows high performance (0.4530), validating the importance of recent trends and context-based recommendation.
-* **Dynamic Profiles**: The Weighted Content strategy (0.4287) demonstrates that dynamic user profiles are significantly more effective than static Euclidean distance (0.3879).
+* **ML Dominance**: The optimized LightGBM Classifier (`0.4906`) outperforms the strong popularity baseline by effectively capturing non-linear relationships between user history and recipe attributes.
+* **Robust Baselines**: The Time-Aware Popularity model (`0.4542`) remains a powerful fallback for cold-start scenarios or when user preferences are ambiguous.
+* **Consistency**: Content-based strategies provide a stable "safety net" (`~0.38`) ensuring users always receive relevant suggestions based on their equipment and taste profile.
 
 ## Technical Deep Dive
 
-### 1. Model Performance
-Our **Hybrid ML approach** utilizes a LightGBM Regressor optimized for ranking tasks. 
-* **Classification Accuracy**: With a tuned threshold of **3.2**, the model achieves a **Weighted F1-score of 0.77** and a **Recall for "Like" recipes of 0.69**.
-* **Prediction Precision**: The model demonstrates high reliability with a **Mean Absolute Error (MAE) of 0.81 stars**.
+### 1. Model Architecture
+Our core engine uses a **LightGBM Classifier** trained to predict the probability of a user "liking" a coffee (Rating $\ge$ 3.2).
+* **Objective**: Binary Classification (Like / Dislike).
+* **Performance**: The model achieves a **ROC AUC of ~0.796** on validation data.
+* **Inference Confidence**: In production, the model demonstrates high confidence (e.g., **91% probability** for perfect matches), transitioning from simple heuristics to true probabilistic prediction.
 
-### 2. Feature Importance Analysis
-Information Gain analysis provided deep insights into user preferences:
+### 2. Feature Engineering Strategy
+To solve the "Training-Serving Skew," we implemented **Explicit Feature Construction**:
+* **Delta Features**: Calculated as $|Recipe_{Attribute} - User_{Preference}|$. Lower delta means better match.
+* **Strength Matching**: A dedicated binary feature `strength_match` that penalizes mismatches in caffeine intensity.
+* **Profile Broadcasting**: User preferences are explicitly broadcasted across candidate recipes during inference to ensure data consistency with the training phase.
 
-* **Texture is King**: `taste_body` (Gain: 10112.5) and `taste_pref_body` (Gain: 10007.2) are the primary drivers of satisfaction. This indicates that mouthfeel is a critical decision factor for our users.
-* **Personalization Signal**: The high importance of preference-based features (e.g., `taste_pref_sweetness` at 8512.8) confirms the model effectively tailors results to individual history.
-* **Low Impact Features**: Surprisingly, `strength_match` (Gain: 375.6) was the least important, suggesting users are flexible with strength if the flavor profile matches.
+### 3. Feature Importance Insights
+* **Texture & Sweetness**: `taste_body` and `taste_sweetness` are primary decision drivers, indicating users prioritize mouthfeel and flavor balance over pure caffeine strength.
+* **Preference Alignment**: High gain on `taste_pref_*` features confirms the model is actively using personal history to rank items.
 
 ---
 

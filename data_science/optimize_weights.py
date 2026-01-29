@@ -1,143 +1,249 @@
-import random
+import os
+from datetime import datetime
+from typing import Dict, List, Any
+
 import numpy as np
 import pandas as pd
-from datetime import datetime
+import optuna
 from tqdm import tqdm
-from typing import List, Dict, Any
 
+# Local module imports
 from preprocess import load_all_data, preprocess_coffee_data
 from evaluation import calculate_ndcg
 from recommender import filter_by_equipment
 
-def precalculate_all_profiles(
-    lambda_space: List[float], 
+# --- Constants ---
+TASTE_FEATURES = ['bitterness', 'sweetness', 'acidity', 'body', 'strength']
+FEATURE_COLS = [
+    'taste_bitterness', 
+    'taste_sweetness', 
+    'taste_acidity', 
+    'taste_body', 
+    'strength_norm'
+]
+TOP_K_USERS_FOR_VALIDATION = 100  # Number of users to use for fast validation
+N_TRIALS = 50
+
+
+def prepare_interaction_data(
     train_df: pd.DataFrame, 
     recipes_df: pd.DataFrame
-) -> Dict[float, Dict[str, Dict[str, float]]]:
+) -> pd.DataFrame:
     """
-    Vectorized pre-calculation of user profiles across the hyperparameter space.
-    Minimizes redundant computation by merging datasets once and using 
-    batch processing for decay weights.
+    Prepares interaction data for vectorized calculations.
+
+    Steps:
+    1. Merges user interaction history with recipe details.
+    2. Calculates temporal features: 'days_diff' (recency) and 'context_w' (time of day relevance).
+
+    Args:
+        train_df: DataFrame containing user interactions (ratings, timestamps).
+        recipes_df: DataFrame containing recipe attributes.
+
+    Returns:
+        pd.DataFrame: Merged DataFrame with additional temporal weight columns.
     """
     # Merge interaction history with recipe attributes
     full_history = train_df.merge(recipes_df, on='recipe_id')
     
-    # Temporal feature engineering
+    # Calculate days difference from now
     now = datetime.now()
     full_history['days_diff'] = (now - pd.to_datetime(full_history['timestamp'])).dt.days
-    full_history['hour'] = pd.to_datetime(full_history['timestamp']).dt.hour
     
-    # Determine temporal context slots
-    def get_time_slot(h: int) -> str:
-        if 6 <= h < 12:
-            return "morning"
-        elif 12 <= h < 18:
-            return "afternoon"
-        return "evening"
+    # Vectorized time slot determination
+    hours = pd.to_datetime(full_history['timestamp']).dt.hour
     
-    current_slot = get_time_slot(now.hour)
-    full_history['slot'] = full_history['hour'].apply(get_time_slot)
-    full_history['context_w'] = np.where(full_history['slot'] == current_slot, 1.5, 1.0)
+    # Define current time slot
+    current_h = now.hour
+    if 6 <= current_h < 12:
+        current_slot = 0  # Morning
+    elif 12 <= current_h < 18:
+        current_slot = 1  # Afternoon
+    else:
+        current_slot = 2  # Evening
 
-    cache = {}
-    taste_features = ['taste_bitterness', 'taste_sweetness', 'taste_acidity', 'taste_body', 'strength_norm']
+    # Map interaction hours to slots (0=Morning, 1=Afternoon, 2=Evening)
+    conditions = [
+        (hours >= 6) & (hours < 12),
+        (hours >= 12) & (hours < 18)
+    ]
+    choices = [0, 1]
+    interaction_slots = np.select(conditions, choices, default=2)
+    
+    # Assign context weight: 1.5 if slots match, 1.0 otherwise
+    full_history['context_w'] = np.where(interaction_slots == current_slot, 1.5, 1.0)
+    
+    return full_history
 
-    for lambda_val in lambda_space:
-        # Calculate recency weights with a minimum floor of 0.1
-        full_history['recency_w'] = np.maximum(np.exp(-lambda_val * full_history['days_diff']), 0.1)
-        full_history['final_w'] = full_history['recency_w'] * full_history['context_w']
+
+def calculate_user_profiles(
+    history_df: pd.DataFrame, 
+    lambda_val: float
+) -> pd.DataFrame:
+    """
+    Calculates weighted user preference profiles based on interaction history.
+    
+    Uses exponential decay (lambda) to weigh recent interactions higher.
+    
+    Args:
+        history_df: Pre-processed history DataFrame with 'days_diff' and 'context_w'.
+        lambda_val: Decay factor for recency.
+
+    Returns:
+        pd.DataFrame: A DataFrame indexed by user_id containing weighted average taste features.
+    """
+    # Calculate recency weight: exp(-lambda * days)
+    recency_w = np.exp(-lambda_val * history_df['days_diff'])
+    
+    # Combine recency and context weights (with a minimum floor of 0.01)
+    final_w = np.maximum(recency_w, 0.01) * history_df['context_w']
+    
+    # Create a temporary DF for weighted aggregation
+    # Multiply taste features by the calculated weight
+    weighted_features = history_df[FEATURE_COLS].multiply(final_w, axis=0)
+    weighted_features['user_id'] = history_df['user_id']
+    weighted_features['weight'] = final_w
+    
+    # Aggregation: Sum of weighted features and sum of weights
+    grouped = weighted_features.groupby('user_id')
+    sum_features = grouped[FEATURE_COLS].sum()
+    sum_weights = grouped['weight'].sum()
+    
+    # Normalize to get the weighted average profile
+    profiles_df = sum_features.div(sum_weights, axis=0)
+    
+    return profiles_df
+
+
+def objective(
+    trial: optuna.Trial,
+    history_base: pd.DataFrame,
+    test_users: np.ndarray,
+    user_equipment_map: Dict,
+    true_ratings_map: Dict,
+    recipes: pd.DataFrame
+) -> float:
+    """
+    Optuna objective function to optimize heuristic weights.
+    
+    Search Space:
+    - lambda: Temporal decay rate.
+    - w_*: Importance weights for each taste feature.
+    """
+    # --- 1. Define Hyperparameters (Search Space) ---
+    lambda_val = trial.suggest_float("lambda", 0.0001, 0.1, log=True)
+    
+    weights = {}
+    for feature in TASTE_FEATURES:
+        weights[feature] = trial.suggest_float(f"w_{feature}", 0.0, 3.0)
+
+    # --- 2. Calculate User Profiles ---
+    profiles_df = calculate_user_profiles(history_base, lambda_val)
+    
+    # --- 3. Evaluation Loop ---
+    scores = []
+    
+    # Convert weights dict to array in the correct order for vectorization
+    w_vector = np.array([weights[f] for f in TASTE_FEATURES])
+
+    for user_id in test_users:
+        if user_id not in profiles_df.index or user_id not in user_equipment_map:
+            continue
+            
+        # Get user profile vector [bitter, sweet, acid, body, strength]
+        user_profile_vector = profiles_df.loc[user_id].values
         
-        # Batch profile generation via group aggregation
-        profiles = {}
-        grouped = full_history.groupby('user_id')
+        # Filter recipes by owned equipment
+        owned_eq = user_equipment_map[user_id]
+        available = filter_by_equipment(owned_eq, recipes)
         
-        for user_id, group in grouped:
-            total_weight = group['final_w'].sum()
-            user_profile = {}
-            for feature in taste_features:
-                user_profile[feature] = (group[feature] * group['final_w']).sum() / total_weight
-            profiles[user_id] = user_profile
+        if available.empty:
+            continue
+
+        # Extract recipe feature matrix (N_recipes x 5_features)
+        recipe_matrix = available[FEATURE_COLS].values
         
-        cache[lambda_val] = profiles
-    return cache
+        # Calculate Weighted Euclidean Distance: Sum(W * (R - U)^2)
+        diff_sq = (recipe_matrix - user_profile_vector) ** 2
+        weighted_dist = np.sum(diff_sq * w_vector, axis=1)
+        
+        # Calculate Score (Inverse distance)
+        # Use copy to avoid SettingWithCopyWarning on the slice
+        available_scored = available.copy()
+        available_scored['score'] = 1 / (1 + np.sqrt(weighted_dist))
+        
+        # Get top 5 recommendations
+        top_recs = available_scored.nlargest(5, 'score')['recipe_id'].tolist()
+        
+        # Calculate Metric (NDCG)
+        true_ratings = true_ratings_map.get(user_id, {})
+        if true_ratings:
+            scores.append(calculate_ndcg(true_ratings, top_recs, n=5))
+    
+    # Return mean score (maximize this)
+    return np.mean(scores) if scores else 0.0
+
 
 def main():
     """
-    Main execution routine for hyperparameter optimization using Randomized Search.
-    Optimizes feature weights and the temporal decay constant (Lambda).
+    Main execution routine for hyperparameter optimization using Optuna.
     """
-    # Load and preprocess datasets
+    # 1. Load Data
+    print("Loading datasets...")
     recipes_raw, users_raw, train_raw, test_raw, _ = load_all_data()
+    
+    # Filter test data to only include valid ratings
     test_raw = test_raw.dropna(subset=['rating'])
+    
+    print("Preprocessing data...")
     recipes, users, train = preprocess_coffee_data(recipes_raw, users_raw, train_raw)
-
-    # Search space definition
-    lambda_space = [0.001, 0.005, 0.01, 0.02]
-    weight_options = [0.5, 1.0, 2.0]
-    taste_features = ['bitterness', 'sweetness', 'acidity', 'body', 'strength']
-    n_trials = 100 
-
-    # Profile pre-calculation phase
-    profile_cache = precalculate_all_profiles(lambda_space, train, recipes)
-
-    best_ndcg = -1.0
-    best_params = {}
-
-    # Optimization loop optimization
-    test_users = test_raw['user_id'].unique()
+    
+    # 2. Prepare Base Interaction Data
+    # Computed once to avoid overhead inside the optimization loop
+    print("Preparing base interaction data (temporal features)...")
+    history_base = prepare_interaction_data(train, recipes)
+    
+    # 3. Cache Data for Optimization
+    # Use a subset of users for faster validation during optimization
+    test_users = test_raw['user_id'].unique()[:TOP_K_USERS_FOR_VALIDATION]
+    
     user_equipment_map = dict(zip(users['user_id'], users['owned_equipment']))
     
-    for _ in tqdm(range(n_trials), desc="Hyperparameter Optimization"):
-        current_lambda = random.choice(lambda_space)
-        current_weights = {feature: random.choice(weight_options) for feature in taste_features}
-        active_profiles = profile_cache[current_lambda]
-        
-        trial_scores = []
-        for user_id in test_users:
-            if user_id not in active_profiles or user_id not in user_equipment_map:
-                continue
-            
-            user_test_set = test_raw[test_raw['user_id'] == user_id]
-            owned_equipment = user_equipment_map[user_id]
-            available_recipes = filter_by_equipment(owned_equipment, recipes)
-            
-            if available_recipes.empty:
-                continue
-            
-            dynamic_profile = active_profiles[user_id]
-            
-            # Weighted Euclidean distance vectorization
-            squared_diff_sum = 0
-            for feature, weight in current_weights.items():
-                target_col = 'strength_norm' if feature == 'strength' else f'taste_{feature}'
-                u_val = dynamic_profile[target_col]
-                r_val = available_recipes[target_col]
-                squared_diff_sum += weight * (r_val - u_val)**2
-            
-            available_recipes['score'] = 1 / (1 + np.sqrt(squared_diff_sum))
-            top_recommendations = available_recipes.sort_values(
-                'score', ascending=False
-            ).head(5)['recipe_id'].tolist()
-            
-            true_ratings = dict(zip(user_test_set['recipe_id'], user_test_set['rating']))
-            trial_scores.append(calculate_ndcg(true_ratings, top_recommendations, n=5))
-            
-        mean_ndcg = np.mean(trial_scores) if trial_scores else 0.0
-        
-        if mean_ndcg > best_ndcg:
-            best_ndcg = mean_ndcg
-            best_params = {
-                "weights": current_weights, 
-                "lambda": current_lambda
-            }
+    # Pre-build a map of ground truth ratings for O(1) access
+    true_ratings_map = {
+        uid: dict(zip(
+            test_raw[test_raw['user_id'] == uid]['recipe_id'], 
+            test_raw[test_raw['user_id'] == uid]['rating']
+        ))
+        for uid in test_users
+    }
 
-    # Technical output reporting
-    print("\n" + "="*40)
-    print(f"OPTIMIZATION SUMMARY")
-    print(f"Best Mean NDCG@5: {best_ndcg:.4f}")
-    print(f"Optimal Lambda: {best_params.get('lambda')}")
-    print(f"Optimal Feature Weights: {best_params.get('weights')}")
-    print("="*40)
+    # 4. Run Optuna Optimization
+    print("\nStarting Optuna Optimization...")
+    
+    # Use partial or lambda to inject static data into the objective function
+    study = optuna.create_study(direction="maximize", study_name="Heuristic_Weights_Tuning")
+    
+    study.optimize(
+        lambda trial: objective(
+            trial, 
+            history_base, 
+            test_users, 
+            user_equipment_map, 
+            true_ratings_map, 
+            recipes
+        ), 
+        n_trials=N_TRIALS
+    )
+
+    # 5. Output Results
+    print("\n" + "=" * 40)
+    print("OPTIMIZATION COMPLETE")
+    print(f"Best NDCG: {study.best_value:.4f}")
+    print("Best Parameters:")
+    for k, v in study.best_params.items():
+        print(f"  {k}: {v:.4f}")
+    print("=" * 40)
 
 if __name__ == "__main__":
     main()
