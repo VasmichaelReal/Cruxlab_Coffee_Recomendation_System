@@ -107,12 +107,12 @@ To start the full system, you need to run both the backend server and the fronte
 The server handles API requests and model inference. Navigate to the project root and run:
 ```bash
 # Assuming the server entry point is server/main.py
-python server/main.py
+python -m server.main
 ```
 ### 4.2. Start the Frontend Interface
 
 The frontend is powered by Streamlit and provides a user-friendly interface to interact with the recommendation engine. It handles user inputs and displays personalized coffee suggestions in real-time.
 
 ```bash
-# From the project root, run the Streamlit application
+# From the project root, run the Streamlit application from another terminal with activated .venv
 streamlit run frontend/app.py
